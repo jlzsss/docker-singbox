@@ -1,0 +1,276 @@
+name: Manual Build Docker Image
+
+on:
+  # 允许手动触发，可选输入指定版本号
+  workflow_dispatch:
+    inputs:
+      stable_version:
+        description: '稳定版版本号 (留空则使用 ReleaseTag 文件中的版本)'
+        required: false
+        default: ''
+      pre_version:
+        description: '预发布版版本号 (留空则使用 PreReleaseTag 文件中的版本)'
+        required: false
+        default: ''
+  # 当 Dockerfile 发生变化时自动触发
+  push:
+    paths:
+      - 'Dockerfile'
+
+env:
+  # Docker Hub 镜像名称
+  DOCKER_IMAGE: jlzsss/singbox
+  # GitHub Container Registry (ghcr.io) 镜像名称
+  GHCR_IMAGE: ghcr.io/jlzsss/singbox
+
+jobs:
+  # Job 1: 准备阶段 - 直接读取本地文件中的版本号
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      stable_version: ${{ steps.set-version.outputs.stable_version }}
+      pre_version: ${{ steps.set-version.outputs.pre_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: 从文件设置版本号
+        id: set-version
+        run: |
+          INPUT_STABLE="${{ github.event.inputs.stable_version }}"
+          INPUT_PRE="${{ github.event.inputs.pre_version }}"
+          STABLE_VERSION="${INPUT_STABLE:-$(cat ReleaseTag | head -n1)}"
+          PRE_VERSION="${INPUT_PRE:-$(cat PreReleaseTag | head -n1)}"
+          echo "stable_version=${STABLE_VERSION}" >> $GITHUB_OUTPUT
+          echo "pre_version=${PRE_VERSION}" >> $GITHUB_OUTPUT
+
+  # Job 2-1: 构建稳定版 (无条件)
+  build-stable:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64        # v1 (兼容性最好)
+          - linux/amd64/v2     # v2 (兼容 J4125 等)
+          - linux/amd64/v3     # v3 (高性能 AVX2)
+          - linux/arm/v7
+          - linux/arm64
+          - linux/ppc64le
+          - linux/s390x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 准备平台名称 (用于 artifact)
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录到 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          
+      - name: 登录到 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: 构建并推送到双仓库 (按摘要)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          provenance: false # 使得生成的镜像 manifest 更纯净，避免产生 unknown/attestation 类型
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.stable_version }}
+          tags: |-
+            ${{ env.DOCKER_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+
+      - name: 导出摘要 (digest)
+        run: |
+          mkdir -p /tmp/digests-stable
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests-stable/${digest#sha256:}"
+
+      - name: 上传稳定版摘要为 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-stable-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests-stable/*
+          retention-days: 1
+          
+  # Job 2-2: 构建预发布版 (无条件)
+  build-pre:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64        # v1
+          - linux/amd64/v2     # v2
+          - linux/amd64/v3     # v3
+          - linux/arm/v7
+          - linux/arm64
+          - linux/ppc64le
+          - linux/s390x
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 准备平台名称 (用于 artifact)
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> $GITHUB_ENV
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录到 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          
+      - name: 登录到 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送到双仓库 (按摘要)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          provenance: false # 使得生成的镜像 manifest 更纯净，避免产生 unknown/attestation 类型
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.pre_version }}
+          tags: |-
+            ${{ env.DOCKER_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+
+      - name: 导出摘要 (digest)
+        run: |
+          mkdir -p /tmp/digests-pre
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests-pre/${digest#sha256:}"
+
+      - name: 上传预发布版摘要为 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-pre-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests-pre/*
+          retention-days: 1
+
+  # Job 3-1: 合并稳定版镜像
+  merge-stable:
+    runs-on: ubuntu-latest
+    needs: [prepare, build-stable]
+    if: success()
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 登录到双仓库
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: 下载所有稳定版摘要
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-stable-*
+          path: /tmp/digests
+          merge-multiple: true
+      
+      - name: 创建并推送稳定版 manifest list 到双仓库
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.DOCKER_IMAGE }}:latest \
+            --tag ${{ env.DOCKER_IMAGE }}:${{ needs.prepare.outputs.stable_version }} \
+            --tag ${{ env.GHCR_IMAGE }}:latest \
+            --tag ${{ env.GHCR_IMAGE }}:${{ needs.prepare.outputs.stable_version }} \
+            $(printf '${{ env.DOCKER_IMAGE }}@sha256:%s ' *)
+          
+      - name: 检查双仓库的最终镜像
+        if: always()
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKER_IMAGE }}:latest
+          docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:latest
+
+  # Job 3-2: 合并预发布版镜像
+  merge-pre:
+    runs-on: ubuntu-latest
+    needs: [prepare, build-pre]
+    if: success()
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 登录到双仓库
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 下载所有预发布版摘要
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-pre-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: 创建并推送预发布版 manifest list 到双仓库
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.DOCKER_IMAGE }}:dev \
+            --tag ${{ env.DOCKER_IMAGE }}:${{ needs.prepare.outputs.pre_version }} \
+            --tag ${{ env.GHCR_IMAGE }}:dev \
+            --tag ${{ env.GHCR_IMAGE }}:${{ needs.prepare.outputs.pre_version }} \
+            $(printf '${{ env.DOCKER_IMAGE }}@sha256:%s ' *)
+          
+      - name: 检查双仓库的最终镜像
+        if: always()
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKER_IMAGE }}:dev
+          docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:dev
+          

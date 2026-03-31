@@ -1,0 +1,27 @@
+{
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "::",
+      "listen_port": 25500
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "dongtaiwang.com",
+      "server": "157.254.223.48",
+      "server_port": 11540,
+      "uuid": "6845cb43-4b8d-49e8-a011-1051d6c4d2ae",
+      "password": "6845cb43-4b8d-49e8-a011-1051d6c4d2ae",
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "alpn": ["h3"],
+        "insecure": true
+      }
+    }
+  ]
+}
